@@ -120,25 +120,32 @@ class _UploadPageState extends State<UploadPage> {
     });
 
     try {
-      // Store under uid/ subfolder for per-user Storage RLS
       final fileName = '${user.id}/${DateTime.now().millisecondsSinceEpoch}.jpg';
 
       setState(() => _uploadProgress = 0.2);
 
+      // Step 1: Upload to Supabase Storage
       await supabase.storage.from('faces').upload(fileName, _selectedFile!);
       setState(() => _uploadProgress = 0.4);
 
       final imageUrl = supabase.storage.from('faces').getPublicUrl(fileName);
       setState(() => _uploadProgress = 0.6);
 
+      // Step 2: Call Face Recognition API
       setState(() => _statusMessage = 'Recognizing faces…');
       final results = await _recognizeFace(_selectedFile!);
       debugPrint('Recognition Results: $results');
       setState(() => _uploadProgress = 0.8);
 
-      final String knownPersonId = await _resolveDefaultKnownPersonId(user.id);
+      // Step 3: Resolve known_person_id from recognition result
+      //         If API returned a name → find/create a known_person with that name
+      //         If API returned nothing → fall back to "Unassigned"
+      final String knownPersonId = await _resolvePersonFromRecognition(
+        results: results,
+        userId:  user.id,
+      );
 
-      // ⚠️ Include user_id so RLS INSERT policy is satisfied
+      // Step 4: Save to face_embeddings with the resolved person
       await supabase.from('face_embeddings').insert({
         'known_person_id': knownPersonId,
         'image_url':       imageUrl,
@@ -153,10 +160,12 @@ class _UploadPageState extends State<UploadPage> {
 
       if (!mounted) return;
 
+      // Step 5: Show recognition dialog
       await _showRecognitionDialog(results);
 
       await Future.delayed(const Duration(milliseconds: 300));
       if (!mounted) return;
+
       Navigator.push(
         context,
         MaterialPageRoute(builder: (_) => const ImageGalleryPage()),
@@ -169,6 +178,100 @@ class _UploadPageState extends State<UploadPage> {
     }
   }
 
+// ── Resolve known_person_id from API recognition results ────
+//
+// Logic:
+//   • If API returned results with a valid name:
+//       → Look for an existing known_person with that name for this user
+//       → If found, reuse it (same person may appear in multiple photos)
+//       → If not found, create a new known_person with the recognized name
+//   • If API returned no results OR name is empty/unknown:
+//       → Fall back to the default "Unassigned" person
+//
+  Future<String> _resolvePersonFromRecognition({
+    required List<dynamic> results,
+    required String        userId,
+  }) async {
+    // Pick the best (highest confidence) result that has a real name
+    Map<String, dynamic>? bestMatch;
+
+    for (final r in results) {
+      final name = (r['name'] as String?)?.trim() ?? '';
+
+      // Skip empty names or generic "unknown" labels from the API
+      if (name.isEmpty ||
+          name.toLowerCase() == 'unknown' ||
+          name.toLowerCase() == 'unassigned') {
+        continue;
+      }
+
+      if (bestMatch == null) {
+        bestMatch = r as Map<String, dynamic>;
+      } else {
+        // Keep highest confidence
+        final currentConf = (r['confidence'] as num?)?.toDouble()         ?? 0.0;
+        final bestConf    = (bestMatch['confidence'] as num?)?.toDouble() ?? 0.0;
+        if (currentConf > bestConf) {
+          bestMatch = r as Map<String, dynamic>;
+        }
+      }
+    }
+
+    // No valid recognized name → fall back to Unassigned
+    if (bestMatch == null) {
+      return _resolveDefaultKnownPersonId(userId);
+    }
+
+    final recognizedName         = (bestMatch['name'] as String).trim();
+    final recognizedRelationship = (bestMatch['relationship'] as String?)?.trim() ?? 'unknown';
+
+    // Resolve patient (same logic as before)
+    final patientRows = await supabase
+        .from('patients')
+        .select('id')
+        .eq('full_name', 'Default Patient')
+        .limit(1);
+
+    late String patientId;
+    if (patientRows.isEmpty) {
+      final ins = await supabase
+          .from('patients')
+          .insert({'full_name': 'Default Patient'})
+          .select('id')
+          .single();
+      patientId = ins['id'] as String;
+    } else {
+      patientId = patientRows[0]['id'] as String;
+    }
+
+    // Check if a known_person with this name already exists for this user
+    final existingRows = await supabase
+        .from('known_persons')
+        .select('id')
+        .eq('user_id',    userId)
+        .eq('patient_id', patientId)
+        .eq('name',       recognizedName)
+        .limit(1);
+
+    if (existingRows.isNotEmpty) {
+      // Reuse existing person record
+      return existingRows[0]['id'] as String;
+    }
+
+    // Create a new known_person with the recognized name
+    final inserted = await supabase
+        .from('known_persons')
+        .insert({
+      'patient_id':   patientId,
+      'name':         recognizedName,
+      'relationship': recognizedRelationship,
+      'user_id':      userId,
+    })
+        .select('id')
+        .single();
+
+    return inserted['id'] as String;
+  }
   // ── Recognition result dialog ───────────────────────────────
   Future<void> _showRecognitionDialog(List<dynamic> results) async {
     await showDialog(

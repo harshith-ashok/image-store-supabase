@@ -38,6 +38,8 @@ dependencies:
   supabase_flutter:
   image_picker_for_web:
   http:
+  camera:
+  path_provider:
 
 dev_dependencies:
   flutter_test:
