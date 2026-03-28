@@ -37,6 +37,8 @@ dependencies:
   image_picker:
   supabase_flutter:
   image_picker_for_web:
+  http:
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
